@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+venv/
+.env
+
+# Data (lives in iidx_data, not here)
+*.npy
+*.parquet
+*.csv
+
+# Model checkpoints and artifacts
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Generated caches, embeddings, and run logs
+cache/
+embeddings/
+*.log

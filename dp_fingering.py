@@ -12,7 +12,7 @@ from typing import Optional
 import math
 
 from finger_model import (
-    Assignment, assignment_cost, transition_velocity,
+    Assignment, assignment_cost, transition_cost, alternation_cost,
     valid_single_assignments, valid_two_key_assignments,
     is_scratch, to_local, SCRATCH_COST,
     P1_SCRATCH, P2_SCRATCH,
@@ -76,16 +76,24 @@ def _transition_cost(
     prev_state: Optional[HandState],
     next_state: HandState,
     time_delta_sec: float,
-    has_scratch: bool,
 ) -> float:
     """
-    Total transition velocity cost between two hand states.
-    For each assignment in next_state, find the most recent assignment
-    for the same finger in prev_state and compute transition velocity.
+    Total rate-based transition cost between two hand states.
+
+    Per-finger channels (lane switch, jack) are charged for each finger active in
+    next_state against its own previous assignment; cross-finger handoff is
+    charged once for the whole state against the binding coupled pair.
+
+    Note this is first-order: a finger that skipped a timestep reads as idle
+    rather than as firing at the two-step rate. That is an approximation in the
+    *search*; exact per-finger rates are recovered from the chosen path during
+    feature extraction, where the full timeline is available.
+
+    Scratch cost is intentionally NOT added here — it's already counted once,
+    as a flat static cost, in _state_cost (consistent with how the deviation
+    term is treated: once per timestep, not time-normalized).
     """
     cost = 0.0
-    if has_scratch:
-        cost += SCRATCH_COST / max(time_delta_sec, 1e-6)
 
     prev_by_finger = {}
     if prev_state:
@@ -94,7 +102,9 @@ def _transition_cost(
 
     for a in next_state:
         prev_a = prev_by_finger.get(a.finger)
-        cost += transition_velocity(prev_a, a, time_delta_sec)
+        cost += transition_cost(prev_a, a, time_delta_sec)
+
+    cost += alternation_cost(prev_state, next_state, time_delta_sec)
 
     return cost
 
@@ -168,7 +178,7 @@ def infer_fingering(
                 static = _state_cost(state, has_scratch)
                 best_k = []
                 for pi, (prev_cost, prev_state, _) in enumerate(dp[t - 1]):
-                    trans = _transition_cost(prev_state, state, time_delta, has_scratch)
+                    trans = _transition_cost(prev_state, state, time_delta)
                     total = prev_cost + static + trans
                     best_k.append((total, pi))
                     if len(best_k) >= k_best * 20:

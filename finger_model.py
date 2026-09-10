@@ -30,16 +30,16 @@ FINGER_NAMES = ['pinky', 'ring', 'middle', 'index', 'thumb']
 HOME_A = {PINKY: 1, RING: 2, MIDDLE: 4, INDEX: 6, THUMB: 7}
 HOME_B = {PINKY: 1, RING: 3, MIDDLE: 4, INDEX: 5, THUMB: 7}
 
-# ── Reach envelopes ────────────────────────────────────────────────────────────
-# (min_lane, max_lane) each finger can reach from its home position.
-# Based on anatomy: middle has most reach, pinky the least.
+# ── Valid finger positions ─────────────────────────────────────────────────────
+# Explicit list of local lanes (1–7) each finger can be assigned to.
+# Edit these lists directly — non-contiguous positions are fine.
 
-REACH = {
-    PINKY:  (1, 2),
-    RING:   (1, 4),   # sits naturally between lanes 2–3; can stretch to 1 or 4
-    MIDDLE: (2, 6),
-    INDEX:  (4, 7),
-    THUMB:  (5, 7),
+FINGER_POSITIONS: dict[int, list[int]] = {
+    PINKY:  [1],
+    RING:   [2, 3],
+    MIDDLE: [3, 4, 5],
+    INDEX:  [5, 6],
+    THUMB:  [5,7],
 }
 
 # Fingers that can perform a two-key press (flat of finger covers two adjacent lanes).
@@ -48,21 +48,49 @@ TWO_KEY_CAPABLE = {RING, MIDDLE}
 
 # ── Cost constants ─────────────────────────────────────────────────────────────
 
-# Base deviation cost per lane away from nearest home position.
+# Base deviation cost per lane away from nearest home position. This is the only
+# surviving static term: it is positional (the hand is displaced from rest), not
+# a judgement about which finger is doing the work. It also anchors the Viterbi's
+# choice for isolated notes, where no transition cost applies.
 DEVIATION_COST_PER_LANE = 1.0
-
-# Extra cost for using a weaker finger on a demanding note.
-WEAK_FINGER_COST = {PINKY: 1.5, RING: 0.5, MIDDLE: 0.0, INDEX: 0.0, THUMB: 0.5}
 
 # Base cost for a two-key press (on top of deviation cost).
 TWO_KEY_BASE_COST = {RING: 0.8, MIDDLE: 1.2}
 
-# Jack penalty: effective distance added when the same lane fires twice.
-# Divided by time_available in the transition velocity formula.
-JACK_PENALTY = 3.0
-
 # Scratch lane engagement cost (requires wrist rotation / arm movement).
 SCRATCH_COST = 4.0
+
+# ── Rate ceilings ──────────────────────────────────────────────────────────────
+# Motor difficulty is convex in demanded rate, not linear in 1/Δt: going from 4
+# to 6 notes/sec costs almost nothing, going from 10 to 12 is a wall. Every
+# channel therefore prices as (demanded_rate / ceiling) ** RATE_EXPONENT.
+#
+# Finger identity enters here — as a ceiling, not a flat surcharge. The pinky is
+# not expensive to use, it is expensive to use *fast*, so it only costs anything
+# when the chart actually demands speed from it.
+
+RATE_EXPONENT = 2.5
+
+# Channel 1 — same finger, moving between lanes (ring rocking 2 <-> 3).
+SWITCH_RATE = {PINKY: 5.0, RING: 6.5, MIDDLE: 8.0, INDEX: 8.5, THUMB: 7.0}
+
+# Channel 2 — same finger, same lane, re-struck (jack / 縦連). Hardest channel:
+# no lateral movement assists the release, so ceilings sit below SWITCH_RATE.
+JACK_RATE = {PINKY: 4.0, RING: 5.0, MIDDLE: 6.5, INDEX: 7.0, THUMB: 5.5}
+
+# Channel 3 — two different fingers alternating. Easiest channel, but anatomically
+# coupled pairs cap lower: pinky/ring and ring/middle share extensor tendons and
+# cannot be driven independently at speed.
+ALT_RATE_DEFAULT = 14.0
+ALT_RATE_PAIRS = {
+    frozenset({PINKY,  RING}):    9.0,
+    frozenset({RING,   MIDDLE}): 10.0,
+    frozenset({MIDDLE, INDEX}):  13.0,
+    frozenset({INDEX,  THUMB}):  13.0,
+}
+
+# Each lane of travel beyond the first lowers the rate a switch can sustain.
+SWITCH_DIST_FALLOFF = 0.45
 
 # ── Hand coordinate helpers ───────────────────────────────────────────────────
 
@@ -72,11 +100,18 @@ P1_SCRATCH     = 0
 P2_SCRATCH     = 15
 
 def to_local(lane: int) -> int:
-    """Convert global lane number to hand-local lane (1–7)."""
+    """Convert global lane number to hand-local lane (1–7).
+
+    P2 is the physical mirror of P1: the right hand's thumb sits on the inside
+    of the cabinet (global lane 8) and its pinky on the outside (global lane 14),
+    so P2 keys are reflected rather than shifted. Reflecting here lets both hands
+    share one FINGER_POSITIONS / HOME table, and makes local lane numbers mean
+    the same finger on either side.
+    """
     if lane in P1_KEY_LANES:
         return lane
     if lane in P2_KEY_LANES:
-        return lane - 7   # lane 8 → 1, lane 14 → 7
+        return 15 - lane   # lane 8 → 7 (thumb side), lane 14 → 1 (pinky side)
     raise ValueError(f'scratch lane {lane} has no local key lane')
 
 def is_scratch(lane: int) -> bool:
@@ -123,48 +158,80 @@ def assignment_cost(a: Assignment) -> float:
     if a.is_two_key:
         if a.finger not in TWO_KEY_CAPABLE:
             return float('inf')
+        positions = FINGER_POSITIONS[a.finger]
+        if a.lane not in positions or a.lane2 not in positions:
+            return float('inf')
         base = TWO_KEY_BASE_COST[a.finger]
         dev  = nearest_home_distance(a.finger, a.center)
     else:
-        lo, hi = REACH[a.finger]
-        if not (lo <= a.lane <= hi):
+        if a.lane not in FINGER_POSITIONS[a.finger]:
             return float('inf')
         base = 0.0
         dev  = nearest_home_distance(a.finger, a.lane)
-    return base + dev * DEVIATION_COST_PER_LANE + WEAK_FINGER_COST[a.finger]
+    return base + dev * DEVIATION_COST_PER_LANE
 
 
-def transition_velocity(
+def _rate_cost(rate: float, ceiling: float) -> float:
+    """Convex penalty for demanding `rate` Hz from a channel capped at `ceiling`."""
+    if ceiling <= 0.0:
+        return float('inf')
+    return (rate / ceiling) ** RATE_EXPONENT
+
+
+def transition_cost(
     prev_assignment: Optional[Assignment],
     next_assignment: Assignment,
     time_delta_sec: float,
 ) -> float:
     """
-    Cost of moving from prev_assignment to next_assignment given the time available.
+    Cost of driving one finger from prev_assignment to next_assignment in the
+    time available. Covers channels 1 (lane switch) and 2 (jack); cross-finger
+    alternation is channel 3, priced by alternation_cost over whole hand states.
 
-    Returns effective_distance / time_delta — higher = harder.
+    A finger that was idle costs nothing to engage — the static deviation term
+    in assignment_cost already accounts for where it has to reach.
     """
     if time_delta_sec <= 0:
         return float('inf')
-
     if prev_assignment is None:
-        # First note: cost is deviation from home only, normalised by time
-        return assignment_cost(next_assignment) / time_delta_sec
+        return 0.0
 
-    same_finger = (prev_assignment.finger == next_assignment.finger)
-    same_lanes  = (prev_assignment.covered_lanes == next_assignment.covered_lanes)
+    rate = 1.0 / time_delta_sec
 
-    if same_finger and same_lanes:
-        # Jack: same finger, same lane(s) fired again
-        effective_distance = JACK_PENALTY
-    else:
-        # Spatial distance between the two assignments' centres
-        effective_distance = abs(prev_assignment.center - next_assignment.center)
-        # Additional cost if changing from single to two-key or vice versa
-        if prev_assignment.is_two_key != next_assignment.is_two_key:
-            effective_distance += 0.5
+    if prev_assignment.covered_lanes == next_assignment.covered_lanes:
+        return _rate_cost(rate, JACK_RATE[next_assignment.finger])
 
-    return effective_distance / time_delta_sec
+    distance = abs(prev_assignment.center - next_assignment.center)
+    if prev_assignment.is_two_key != next_assignment.is_two_key:
+        distance += 0.5
+    ceiling = (SWITCH_RATE[next_assignment.finger]
+               / (1.0 + SWITCH_DIST_FALLOFF * max(distance - 1.0, 0.0)))
+    return _rate_cost(rate, ceiling)
+
+
+def alternation_cost(prev_state, next_state, time_delta_sec: float) -> float:
+    """
+    Channel 3: cost of handing off between two different fingers of one hand.
+
+    Charged once per timestep against the *binding* pair — the coupled pair with
+    the lowest ceiling — rather than once per finger, so wide chords are not
+    penalised simply for being wide (density already measures that).
+    """
+    if time_delta_sec <= 0 or not prev_state or not next_state:
+        return 0.0
+
+    prev_fingers = {a.finger for a in prev_state}
+    next_fingers = {a.finger for a in next_state}
+    engaged  = next_fingers - prev_fingers
+    released = prev_fingers - next_fingers
+    if not engaged or not released:
+        return 0.0
+
+    ceiling = min(
+        ALT_RATE_PAIRS.get(frozenset({f_out, f_in}), ALT_RATE_DEFAULT)
+        for f_in in engaged for f_out in released
+    )
+    return _rate_cost(1.0 / time_delta_sec, ceiling)
 
 
 # ── Valid assignment enumeration ───────────────────────────────────────────────
@@ -173,8 +240,7 @@ def valid_single_assignments(local_lane: int) -> list[Assignment]:
     """All finger assignments that can cover local_lane with finite cost."""
     out = []
     for finger in range(5):
-        lo, hi = REACH[finger]
-        if lo <= local_lane <= hi:
+        if local_lane in FINGER_POSITIONS[finger]:
             a = Assignment(finger=finger, lane=local_lane)
             if assignment_cost(a) < float('inf'):
                 out.append(a)
